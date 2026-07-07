@@ -32,6 +32,8 @@ Precedence is **flags > env > defaults**:
 | `--port N` | `ZONDE_PORT` | `9100` |
 | `--otlp URL` | `ZONDE_OTLP_ENDPOINT` | (unset → pull mode) |
 | `--interval S` | `ZONDE_INTERVAL` | `60` |
+| `--path.procfs PATH` | `ZONDE_PATH_PROCFS` | `/proc` |
+| `--path.rootfs PATH` | `ZONDE_PATH_ROOTFS` | (none) |
 
 ## Release & container
 
@@ -48,10 +50,19 @@ Prebuilt multi-arch images are published to GHCR on version tags:
 docker run -p 9100:9100 ghcr.io/codenlighten/zonde:latest
 ```
 
-Inside a container the collectors read the *container's* `/proc`. To monitor the **host**
-from a container, share its namespaces (`docker run --pid=host --net=host ...`); otherwise
-run the [systemd unit](#running-as-a-service-systemd) directly on the host. (A configurable
-`--path.procfs`, like node_exporter, is on the backlog.)
+Inside a container the collectors read the *container's* `/proc`. To monitor the **host**,
+bind-mount the host's `/proc` (and root, for filesystem stats) and point zonde at them:
+
+```sh
+docker run -p 9100:9100 \
+  -v /proc:/host/proc:ro -v /:/host/root:ro \
+  ghcr.io/codenlighten/zonde:latest \
+  --path.procfs /host/proc --path.rootfs /host/root
+```
+
+`--path.procfs` relocates every `/proc` read; `--path.rootfs` is prepended to filesystem
+mountpoints before `statfs`, so disk metrics reflect the host's filesystems, not the
+container's. (Or just run the [systemd unit](#running-as-a-service-systemd) on the host.)
 
 ## Two ways to ship metrics
 

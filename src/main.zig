@@ -50,6 +50,14 @@ pub fn main(init: std.process.Init) !void {
             cfg.interval_s = try parseNext(io, &args, u64, "--interval");
         } else if (std.mem.startsWith(u8, arg, "--interval=")) {
             cfg.interval_s = parseArg(io, u64, arg["--interval=".len..]);
+        } else if (std.mem.eql(u8, arg, "--path.procfs")) {
+            cfg.procfs_path = args.next() orelse fatal(io, "--path.procfs requires a path", .{});
+        } else if (std.mem.startsWith(u8, arg, "--path.procfs=")) {
+            cfg.procfs_path = arg["--path.procfs=".len..];
+        } else if (std.mem.eql(u8, arg, "--path.rootfs")) {
+            cfg.rootfs_path = args.next() orelse fatal(io, "--path.rootfs requires a path", .{});
+        } else if (std.mem.startsWith(u8, arg, "--path.rootfs=")) {
+            cfg.rootfs_path = arg["--path.rootfs=".len..];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try usage(io);
             return;
@@ -58,18 +66,25 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    const ctx: collectors.Context = .{
+        .io = io,
+        .gpa = gpa,
+        .procfs = cfg.procfs_path,
+        .rootfs = cfg.rootfs_path,
+    };
+
     switch (cfg.mode) {
-        .once => try printScrape(io, gpa),
-        .serve => try server.serve(io, gpa, cfg.listen_addr, cfg.port),
-        .push => try exporter.run(io, gpa, cfg.otlp_endpoint.?, cfg.interval_s),
+        .once => try printScrape(ctx),
+        .serve => try server.serve(ctx, cfg.listen_addr, cfg.port),
+        .push => try exporter.run(ctx, cfg.otlp_endpoint.?, cfg.interval_s),
     }
 }
 
-fn printScrape(io: std.Io, gpa: std.mem.Allocator) !void {
+fn printScrape(ctx: collectors.Context) !void {
     var buf: [64 * 1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
+    var stdout = std.Io.File.stdout().writer(ctx.io, &buf);
     var prom = PromSink{ .w = &stdout.interface };
-    try collectors.scrape(io, gpa, prom.sink());
+    try collectors.scrape(ctx, prom.sink());
     try stdout.interface.flush(); // 0.16 writers buffer — without flush, output is lost.
 }
 
@@ -83,7 +98,7 @@ fn parseArg(io: std.Io, comptime T: type, val: []const u8) T {
 }
 
 fn usage(io: std.Io) !void {
-    var buf: [768]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
     try stdout.interface.writeAll(
         \\zonde — tiny observability agent
@@ -95,9 +110,12 @@ fn usage(io: std.Io) !void {
         \\  zonde --port N            listen on port N
         \\  zonde --otlp URL          push OTLP/JSON to URL on an interval
         \\  zonde --otlp URL --interval S   push every S seconds (default 60)
+        \\  zonde --path.procfs PATH  where /proc is mounted (default /proc)
+        \\  zonde --path.rootfs PATH  prefix for filesystem mountpoints (container host mon.)
         \\  zonde --help              show this help
         \\
-        \\env: ZONDE_LISTEN_ADDR, ZONDE_PORT, ZONDE_OTLP_ENDPOINT, ZONDE_INTERVAL
+        \\env: ZONDE_LISTEN_ADDR, ZONDE_PORT, ZONDE_OTLP_ENDPOINT, ZONDE_INTERVAL,
+        \\     ZONDE_PATH_PROCFS, ZONDE_PATH_ROOTFS
         \\     (flags override env; env overrides defaults)
         \\
     );

@@ -1,6 +1,6 @@
-//! Linux `/proc` collectors. Each reads a `/proc` file with the passed-in `Io`,
-//! parses it, and emits samples into a `metric.Sink` — which renders them as
-//! Prometheus text or OTLP/JSON. No globals, no hidden I/O.
+//! Linux `/proc` collectors. Each reads a file under the configured procfs base
+//! with the `Context`'s `Io`, parses it, and emits samples into a `metric.Sink`
+//! — which renders them as Prometheus text or OTLP/JSON. No globals, no hidden I/O.
 //!
 //! Collectors are registered in `registry`; `scrape` runs them all and turns any
 //! single failure into a `zonde_collector_error` sample rather than aborting.
@@ -27,7 +27,19 @@ const sector_bytes: u64 = 512;
 /// block devices). Keeps collectors allocation-free; overflow just truncates.
 const max_rows = 256;
 
-const CollectFn = *const fn (Io, Allocator, Sink) anyerror!void;
+/// Everything a collector needs. The base paths make host monitoring from
+/// inside a container possible, mirroring node_exporter's `--path.*` flags:
+///   * `procfs` — where /proc is mounted (default "/proc"; e.g. "/host/proc").
+///   * `rootfs` — prepended to filesystem mountpoints before statfs (default ""
+///     = statfs paths as-is; e.g. "/host/root" when the host root is bind-mounted).
+pub const Context = struct {
+    io: Io,
+    gpa: Allocator,
+    procfs: []const u8 = "/proc",
+    rootfs: []const u8 = "",
+};
+
+const CollectFn = *const fn (Context, Sink) anyerror!void;
 
 pub const Collector = struct {
     name: []const u8,
@@ -47,25 +59,27 @@ pub const registry = [_]Collector{
 /// Run every collector once, emitting a full set of samples into `sink`.
 /// A single collector failing (e.g. a /proc file missing in a container) must
 /// not abort the whole scrape — its failure is surfaced as a sample instead.
-pub fn scrape(io: Io, gpa: Allocator, sink: Sink) anyerror!void {
+pub fn scrape(ctx: Context, sink: Sink) anyerror!void {
     try sink.emit(.{ .name = "zonde_up", .help = "Whether the zonde scrape succeeded.", .kind = .gauge }, &.{}, .{ .int = 1 });
 
     inline for (registry) |c| {
-        c.collect(io, gpa, sink) catch |err| try emitCollectorError(sink, c.name, err);
+        c.collect(ctx, sink) catch |err| try emitCollectorError(sink, c.name, err);
     }
 }
 
 // --- shared helpers ---------------------------------------------------------
 
-/// Read a whole `/proc` file. We must stream to EOF rather than use
-/// `readFileAlloc`: `/proc` files report `st_size == 0`, so any size-hinted
-/// read returns empty. `allocRemaining` loops until the kernel signals EOF.
-fn readProc(io: Io, gpa: Allocator, path: []const u8) ![]u8 {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
+/// Read a whole file under the procfs base (e.g. `sub = "meminfo"` ->
+/// `<procfs>/meminfo`). We must stream to EOF rather than use `readFileAlloc`:
+/// /proc files report `st_size == 0`, so any size-hinted read returns empty.
+fn readProc(ctx: Context, sub: []const u8) ![]u8 {
+    var path_buf: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ ctx.procfs, sub });
+    var file = try std.Io.Dir.cwd().openFile(ctx.io, path, .{});
+    defer file.close(ctx.io);
     var read_buf: [4096]u8 = undefined;
-    var reader = file.readerStreaming(io, &read_buf);
-    return reader.interface.allocRemaining(gpa, .limited(1 << 20));
+    var reader = file.readerStreaming(ctx.io, &read_buf);
+    return reader.interface.allocRemaining(ctx.gpa, .limited(1 << 20));
 }
 
 fn emitCollectorError(sink: Sink, collector: []const u8, err: anyerror) anyerror!void {
@@ -87,9 +101,9 @@ const mem_metrics = [_]MemMetric{
     .{ .key = "Cached", .name = "node_memory_Cached_bytes", .help = "Memory in the page cache." },
 };
 
-fn collectMemory(io: Io, gpa: Allocator, sink: Sink) anyerror!void {
-    const data = try readProc(io, gpa, "/proc/meminfo");
-    defer gpa.free(data);
+fn collectMemory(ctx: Context, sink: Sink) anyerror!void {
+    const data = try readProc(ctx, "meminfo");
+    defer ctx.gpa.free(data);
 
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |line| {
@@ -122,9 +136,9 @@ const cpu_modes = [_][]const u8{
     "user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal",
 };
 
-fn collectCpu(io: Io, gpa: Allocator, sink: Sink) anyerror!void {
-    const data = try readProc(io, gpa, "/proc/stat");
-    defer gpa.free(data);
+fn collectCpu(ctx: Context, sink: Sink) anyerror!void {
+    const data = try readProc(ctx, "stat");
+    defer ctx.gpa.free(data);
 
     const m: Metric = .{ .name = "node_cpu_seconds_total", .help = "Seconds each CPU spent in each mode.", .kind = .counter };
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
@@ -148,9 +162,9 @@ fn collectCpu(io: Io, gpa: Allocator, sink: Sink) anyerror!void {
 
 // --- loadavg -----------------------------------------------------------------
 
-fn collectLoad(io: Io, gpa: Allocator, sink: Sink) anyerror!void {
-    const data = try readProc(io, gpa, "/proc/loadavg");
-    defer gpa.free(data);
+fn collectLoad(ctx: Context, sink: Sink) anyerror!void {
+    const data = try readProc(ctx, "loadavg");
+    defer ctx.gpa.free(data);
 
     var fields = std.mem.tokenizeAny(u8, data, " \t\n");
     const names = [_][]const u8{ "node_load1", "node_load5", "node_load15" };
@@ -205,9 +219,9 @@ fn parseNetdevLine(line: []const u8) ?NetEntry {
     } };
 }
 
-fn collectNetdev(io: Io, gpa: Allocator, sink: Sink) anyerror!void {
-    const data = try readProc(io, gpa, "/proc/net/dev");
-    defer gpa.free(data);
+fn collectNetdev(ctx: Context, sink: Sink) anyerror!void {
+    const data = try readProc(ctx, "net/dev");
+    defer ctx.gpa.free(data);
 
     var rows: [max_rows]NetEntry = undefined;
     var count: usize = 0;
@@ -282,9 +296,9 @@ fn isNoiseDisk(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "loop") or std.mem.startsWith(u8, name, "ram");
 }
 
-fn collectDiskstats(io: Io, gpa: Allocator, sink: Sink) anyerror!void {
-    const data = try readProc(io, gpa, "/proc/diskstats");
-    defer gpa.free(data);
+fn collectDiskstats(ctx: Context, sink: Sink) anyerror!void {
+    const data = try readProc(ctx, "diskstats");
+    defer ctx.gpa.free(data);
 
     var rows: [max_rows]DiskEntry = undefined;
     var count: usize = 0;
@@ -325,19 +339,19 @@ const PressureMetric = struct {
     help: []const u8,
 };
 const pressure_metrics = [_]PressureMetric{
-    .{ .file = "/proc/pressure/cpu", .line_prefix = "some", .name = "node_pressure_cpu_waiting_seconds_total", .help = "Total seconds tasks waited on CPU." },
-    .{ .file = "/proc/pressure/memory", .line_prefix = "some", .name = "node_pressure_memory_waiting_seconds_total", .help = "Total seconds tasks waited on memory." },
-    .{ .file = "/proc/pressure/memory", .line_prefix = "full", .name = "node_pressure_memory_stalled_seconds_total", .help = "Total seconds all tasks stalled on memory." },
-    .{ .file = "/proc/pressure/io", .line_prefix = "some", .name = "node_pressure_io_waiting_seconds_total", .help = "Total seconds tasks waited on I/O." },
-    .{ .file = "/proc/pressure/io", .line_prefix = "full", .name = "node_pressure_io_stalled_seconds_total", .help = "Total seconds all tasks stalled on I/O." },
+    .{ .file = "pressure/cpu", .line_prefix = "some", .name = "node_pressure_cpu_waiting_seconds_total", .help = "Total seconds tasks waited on CPU." },
+    .{ .file = "pressure/memory", .line_prefix = "some", .name = "node_pressure_memory_waiting_seconds_total", .help = "Total seconds tasks waited on memory." },
+    .{ .file = "pressure/memory", .line_prefix = "full", .name = "node_pressure_memory_stalled_seconds_total", .help = "Total seconds all tasks stalled on memory." },
+    .{ .file = "pressure/io", .line_prefix = "some", .name = "node_pressure_io_waiting_seconds_total", .help = "Total seconds tasks waited on I/O." },
+    .{ .file = "pressure/io", .line_prefix = "full", .name = "node_pressure_io_stalled_seconds_total", .help = "Total seconds all tasks stalled on I/O." },
 };
 
-fn collectPressure(io: Io, gpa: Allocator, sink: Sink) anyerror!void {
+fn collectPressure(ctx: Context, sink: Sink) anyerror!void {
     // PSI may be absent (older kernels or CONFIG_PSI=n); reading any file then
     // fails and the whole collector is reported once via zonde_collector_error.
     inline for (pressure_metrics) |m| {
-        const data = try readProc(io, gpa, m.file);
-        defer gpa.free(data);
+        const data = try readProc(ctx, m.file);
+        defer ctx.gpa.free(data);
         const total_us = psiTotal(data, m.line_prefix) orelse return error.MalformedPressure;
         // PSI "total" is accumulated microseconds; Prometheus convention is seconds.
         try sink.emit(.{ .name = m.name, .help = m.help, .kind = .counter }, &.{}, .{ .float = @as(f64, @floatFromInt(total_us)) / 1_000_000.0 });
@@ -408,9 +422,9 @@ const FsEntry = struct {
     files_free: u64,
 };
 
-fn collectFilesystem(io: Io, gpa: Allocator, sink: Sink) anyerror!void {
-    const data = try readProc(io, gpa, "/proc/mounts");
-    defer gpa.free(data);
+fn collectFilesystem(ctx: Context, sink: Sink) anyerror!void {
+    const data = try readProc(ctx, "mounts");
+    defer ctx.gpa.free(data);
 
     var rows: [max_rows]FsEntry = undefined;
     var count: usize = 0;
@@ -422,10 +436,10 @@ fn collectFilesystem(io: Io, gpa: Allocator, sink: Sink) anyerror!void {
         const fstype = f.next() orelse continue;
         if (isPseudoFs(fstype)) continue;
 
-        // statfs needs a NUL-terminated, unescaped path. The mountpoint label
-        // keeps the raw form (escapes are rare and cosmetic).
+        // statfs needs a NUL-terminated, unescaped path, prefixed by rootfs so a
+        // container can statfs the host's mounts. The label keeps the raw form.
         var path_buf: [4096]u8 = undefined;
-        const path = unescapeMount(mountpoint, &path_buf) orelse continue;
+        const path = buildStatfsPath(ctx.rootfs, mountpoint, &path_buf) orelse continue;
         var st: Statfs = undefined;
         if (linux.errno(linux.syscall2(.statfs, @intFromPtr(path.ptr), @intFromPtr(&st))) != .SUCCESS) {
             continue; // unreadable mount (permissions, disconnected network fs, ...)
@@ -465,22 +479,28 @@ fn emitFs(sink: Sink, list: []const FsEntry, name: []const u8, help: []const u8,
     }
 }
 
-/// Decode `/proc/mounts` octal escapes (`\040` -> space, `\134` -> `\`) into
-/// `buf` and NUL-terminate. Returns null if the result would overflow `buf`.
-fn unescapeMount(s: []const u8, buf: []u8) ?[:0]const u8 {
-    var i: usize = 0;
+/// Build the NUL-terminated path to statfs: `prefix` (rootfs) followed by the
+/// mountpoint with `/proc/mounts` octal escapes decoded (`\040` -> space).
+/// Returns null if the result would overflow `buf`.
+fn buildStatfsPath(prefix: []const u8, mountpoint: []const u8, buf: []u8) ?[:0]const u8 {
     var j: usize = 0;
-    while (i < s.len) {
+    for (prefix) |c| {
+        if (j >= buf.len - 1) return null;
+        buf[j] = c;
+        j += 1;
+    }
+    var i: usize = 0;
+    while (i < mountpoint.len) {
         if (j >= buf.len - 1) return null; // leave room for the NUL
-        if (s[i] == '\\' and i + 4 <= s.len) {
-            if (octalByte(s[i + 1 .. i + 4])) |b| {
+        if (mountpoint[i] == '\\' and i + 4 <= mountpoint.len) {
+            if (octalByte(mountpoint[i + 1 .. i + 4])) |b| {
                 buf[j] = b;
                 i += 4;
                 j += 1;
                 continue;
             }
         }
-        buf[j] = s[i];
+        buf[j] = mountpoint[i];
         i += 1;
         j += 1;
     }
@@ -580,12 +600,15 @@ test "octalByte parses valid octal, rejects the rest" {
     try std.testing.expect(octalByte("400") == null); // 256 > 255
 }
 
-test "unescapeMount decodes escapes and NUL-terminates" {
+test "buildStatfsPath: decodes escapes, applies rootfs prefix, NUL-terminates" {
     var buf: [64]u8 = undefined;
-    const got = unescapeMount("/mnt/my\\040disk", &buf).?;
-    try std.testing.expectEqualStrings("/mnt/my disk", got);
-    try std.testing.expectEqual(@as(u8, 0), got.ptr[got.len]); // sentinel present
 
-    const plain = unescapeMount("/", &buf).?;
-    try std.testing.expectEqualStrings("/", plain);
+    // no prefix, with an escaped space
+    const p1 = buildStatfsPath("", "/mnt/my\\040disk", &buf).?;
+    try std.testing.expectEqualStrings("/mnt/my disk", p1);
+    try std.testing.expectEqual(@as(u8, 0), p1.ptr[p1.len]); // sentinel present
+
+    // rootfs prefix for container host-monitoring
+    const p2 = buildStatfsPath("/host/root", "/home", &buf).?;
+    try std.testing.expectEqualStrings("/host/root/home", p2);
 }

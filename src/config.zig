@@ -15,6 +15,9 @@ pub const Config = struct {
     port: u16 = 9100,
     otlp_endpoint: ?[]const u8 = null,
     interval_s: u64 = 60,
+    // Base paths for host monitoring from a container (node_exporter-style).
+    procfs_path: []const u8 = "/proc",
+    rootfs_path: []const u8 = "",
 };
 
 /// Defaults overlaid with `ZONDE_*` environment variables. Malformed numeric
@@ -32,5 +35,7 @@ pub fn fromEnv(env: *const Environ.Map) Config {
         c.otlp_endpoint = v;
         c.mode = .push; // presence of an endpoint selects agent mode
     }
+    if (env.get("ZONDE_PATH_PROCFS")) |v| c.procfs_path = v;
+    if (env.get("ZONDE_PATH_ROOTFS")) |v| c.rootfs_path = v;
     return c;
 }

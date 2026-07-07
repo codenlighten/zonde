@@ -7,17 +7,17 @@
 
 const std = @import("std");
 const Io = std.Io;
-const Allocator = std.mem.Allocator;
 const collectors = @import("collectors.zig");
 const OtlpSink = @import("sink_otlp.zig").OtlpSink;
 
-pub fn run(io: Io, gpa: Allocator, endpoint: []const u8, interval_s: u64) !void {
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+pub fn run(ctx: collectors.Context, endpoint: []const u8, interval_s: u64) !void {
+    const io = ctx.io;
+    var client: std.http.Client = .{ .allocator = ctx.gpa, .io = io };
     defer client.deinit();
 
     logInfo(io, "OTLP push -> {s} every {d}s", .{ endpoint, interval_s });
     while (true) {
-        pushOnce(io, gpa, &client, endpoint) catch |err| {
+        pushOnce(ctx, &client, endpoint) catch |err| {
             logInfo(io, "push failed: {s}", .{@errorName(err)});
         };
         // Monotonic clock so wall-clock jumps (NTP) don't skew the interval.
@@ -25,13 +25,13 @@ pub fn run(io: Io, gpa: Allocator, endpoint: []const u8, interval_s: u64) !void 
     }
 }
 
-fn pushOnce(io: Io, gpa: Allocator, client: *std.http.Client, endpoint: []const u8) !void {
-    var body: std.Io.Writer.Allocating = .init(gpa);
+fn pushOnce(ctx: collectors.Context, client: *std.http.Client, endpoint: []const u8) !void {
+    var body: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer body.deinit();
 
-    const ts = std.Io.Timestamp.now(io, .real).nanoseconds;
+    const ts = std.Io.Timestamp.now(ctx.io, .real).nanoseconds;
     var otlp = OtlpSink.init(&body.writer, ts, "zonde");
-    try collectors.scrape(io, gpa, otlp.sink());
+    try collectors.scrape(ctx, otlp.sink());
     try otlp.finish();
 
     const result = try client.fetch(.{
@@ -40,7 +40,7 @@ fn pushOnce(io: Io, gpa: Allocator, client: *std.http.Client, endpoint: []const 
         .payload = body.written(),
         .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
     });
-    logInfo(io, "pushed {d} bytes -> HTTP {d}", .{ body.written().len, @intFromEnum(result.status) });
+    logInfo(ctx.io, "pushed {d} bytes -> HTTP {d}", .{ body.written().len, @intFromEnum(result.status) });
 }
 
 fn logInfo(io: Io, comptime fmt: []const u8, args: anytype) void {

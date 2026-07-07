@@ -8,14 +8,14 @@
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
-const Allocator = std.mem.Allocator;
 const collectors = @import("collectors.zig");
 const PromSink = @import("sink_prom.zig").PromSink;
 
 /// Prometheus text exposition content-type (format version 0.0.4).
 const exposition_content_type = "text/plain; version=0.0.4; charset=utf-8";
 
-pub fn serve(io: Io, gpa: Allocator, listen_addr: []const u8, port: u16) !void {
+pub fn serve(ctx: collectors.Context, listen_addr: []const u8, port: u16) !void {
+    const io = ctx.io;
     var address = try net.IpAddress.parse(listen_addr, port);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
@@ -30,11 +30,12 @@ pub fn serve(io: Io, gpa: Allocator, listen_addr: []const u8, port: u16) !void {
         // Handle inline for now: one connection at a time. Errors here are
         // per-connection (client hung up, malformed request) and must not kill
         // the server, so we swallow them.
-        handleConnection(io, gpa, stream) catch {};
+        handleConnection(ctx, stream) catch {};
     }
 }
 
-fn handleConnection(io: Io, gpa: Allocator, stream: net.Stream) !void {
+fn handleConnection(ctx: collectors.Context, stream: net.Stream) !void {
+    const io = ctx.io;
     defer stream.close(io);
 
     var recv_buf: [16 * 1024]u8 = undefined;
@@ -46,12 +47,12 @@ fn handleConnection(io: Io, gpa: Allocator, stream: net.Stream) !void {
     // Serve requests until the client closes or asks to (keep-alive).
     while (true) {
         var request = http_server.receiveHead() catch return;
-        try route(io, gpa, &request);
+        try route(ctx, &request);
         if (!request.head.keep_alive) return;
     }
 }
 
-fn route(io: Io, gpa: Allocator, request: *std.http.Server.Request) !void {
+fn route(ctx: collectors.Context, request: *std.http.Server.Request) !void {
     // Path without the query string.
     const target = request.head.target;
     const path = target[0..(std.mem.indexOfScalar(u8, target, '?') orelse target.len)];
@@ -68,7 +69,7 @@ fn route(io: Io, gpa: Allocator, request: *std.http.Server.Request) !void {
     }
 
     if (std.mem.eql(u8, path, "/metrics")) {
-        try respondMetrics(io, gpa, request);
+        try respondMetrics(ctx, request);
     } else if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/health")) {
         try request.respond("zonde ok\n", .{
             .extra_headers = &.{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }},
@@ -78,14 +79,14 @@ fn route(io: Io, gpa: Allocator, request: *std.http.Server.Request) !void {
     }
 }
 
-fn respondMetrics(io: Io, gpa: Allocator, request: *std.http.Server.Request) !void {
+fn respondMetrics(ctx: collectors.Context, request: *std.http.Server.Request) !void {
     // Render the whole exposition into a buffer, then send it with a
     // content-length. Streaming the body directly is a later optimization.
-    var body: std.Io.Writer.Allocating = .init(gpa);
+    var body: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer body.deinit();
 
     var prom = PromSink{ .w = &body.writer };
-    collectors.scrape(io, gpa, prom.sink()) catch {
+    collectors.scrape(ctx, prom.sink()) catch {
         try request.respond("scrape failed\n", .{ .status = .internal_server_error });
         return;
     };
