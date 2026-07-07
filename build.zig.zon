@@ -8,6 +8,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "dist",
         "DECISION.md",
         "README.md",
         "LICENSE",

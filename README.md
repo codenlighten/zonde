@@ -71,6 +71,22 @@ docker build --build-arg TARGET=x86_64-linux-musl -t zonde .   # FROM scratch, ~
 Plus `zonde_up` and, on any collector failure, `zonde_collector_error{collector,error}` (the
 scrape still succeeds). Adding a collector = one parse function + one `registry` entry.
 
+## Running as a service (systemd)
+
+A hardened unit ships in [`dist/`](dist/) (runs as a `DynamicUser`, all capabilities
+dropped, read-only filesystem; `systemd-analyze security` exposure ~1.5, "OK"):
+
+```sh
+sudo install -Dm755 zig-out/release/zonde-x86_64-linux-musl /usr/local/bin/zonde
+sudo install -Dm644 dist/zonde.service /etc/systemd/system/zonde.service
+sudo install -Dm640 dist/zonde.env.example /etc/zonde/zonde.env   # then edit
+sudo systemctl enable --now zonde
+curl localhost:9100/metrics
+```
+
+Configure via `/etc/zonde/zonde.env` (see the `ZONDE_*` table above). Logs go to the
+journal: `journalctl -u zonde -f`.
+
 ## Continuous integration
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on push/PR:
