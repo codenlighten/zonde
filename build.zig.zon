@@ -1,6 +1,6 @@
 .{
     .name = .zonde,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0x68053578fc7e72e6,
     .minimum_zig_version = "0.16.0-dev.3153+d6f43caad",
     .dependencies = .{},
