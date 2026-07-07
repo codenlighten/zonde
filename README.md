@@ -38,8 +38,20 @@ Precedence is **flags > env > defaults**:
 ```sh
 zig build release      # stripped ReleaseSmall for linux {x86_64,aarch64}×{gnu,musl}
                        # into zig-out/release/, gated at a 2 MiB size budget
-docker build --build-arg TARGET=x86_64-linux-musl -t zonde .   # FROM scratch, ~585 kB image
+docker build -t zonde .                                             # FROM scratch, ~585 kB image
+docker buildx build --platform linux/amd64,linux/arm64 -t zonde .   # multi-arch
 ```
+
+Prebuilt multi-arch images are published to GHCR on version tags:
+
+```sh
+docker run -p 9100:9100 ghcr.io/codenlighten/zonde:latest
+```
+
+Inside a container the collectors read the *container's* `/proc`. To monitor the **host**
+from a container, share its namespaces (`docker run --pid=host --net=host ...`); otherwise
+run the [systemd unit](#running-as-a-service-systemd) directly on the host. (A configurable
+`--path.procfs`, like node_exporter, is on the backlog.)
 
 ## Two ways to ship metrics
 
