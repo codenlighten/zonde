@@ -57,6 +57,9 @@ pub const registry = [_]Collector{
     .{ .name = "filefd", .collect = collectFilefd },
     .{ .name = "entropy", .collect = collectEntropy },
     .{ .name = "stat", .collect = collectStat },
+    .{ .name = "uname", .collect = collectUname },
+    .{ .name = "sockstat", .collect = collectSockstat },
+    .{ .name = "netstat", .collect = collectNetstat },
 };
 
 /// Run every collector once, emitting a full set of samples into `sink`.
@@ -595,7 +598,133 @@ fn collectStat(ctx: Context, sink: Sink) anyerror!void {
         try sink.emit(.{ .name = "node_boot_time_seconds", .help = "Unix time of system boot.", .kind = .gauge }, &.{}, .{ .int = n });
 }
 
+// --- uname -------------------------------------------------------------------
+
+/// node_uname_info carries the host/kernel identity as label values. uname(2) is
+/// a syscall (not a /proc read), and in a container it returns the *host* kernel,
+/// so it needs no procfs base.
+fn collectUname(ctx: Context, sink: Sink) anyerror!void {
+    _ = ctx;
+    const uts = std.posix.uname();
+    try sink.emit(
+        .{ .name = "node_uname_info", .help = "Labeled system information from uname(2).", .kind = .gauge },
+        &.{
+            .{ .name = "sysname", .value = std.mem.sliceTo(&uts.sysname, 0) },
+            .{ .name = "release", .value = std.mem.sliceTo(&uts.release, 0) },
+            .{ .name = "version", .value = std.mem.sliceTo(&uts.version, 0) },
+            .{ .name = "machine", .value = std.mem.sliceTo(&uts.machine, 0) },
+            .{ .name = "nodename", .value = std.mem.sliceTo(&uts.nodename, 0) },
+            .{ .name = "domainname", .value = std.mem.sliceTo(&uts.domainname, 0) },
+        },
+        .{ .int = 1 },
+    );
+}
+
+// --- sockstat ----------------------------------------------------------------
+
+fn collectSockstat(ctx: Context, sink: Sink) anyerror!void {
+    const data = try readProc(ctx, "net/sockstat");
+    defer ctx.gpa.free(data);
+    try emitSockstat(data, sink);
+}
+
+/// Each `/proc/net/sockstat` line is "Proto: key val key val ...". Emit one
+/// gauge per pair: `node_sockstat_<Proto>_<key>`.
+fn emitSockstat(data: []const u8, sink: Sink) anyerror!void {
+    var name_buf: [128]u8 = undefined;
+    var lines = std.mem.tokenizeScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const proto = line[0..colon];
+        var f = std.mem.tokenizeAny(u8, line[colon + 1 ..], " \t");
+        while (true) {
+            const key = f.next() orelse break;
+            const val_str = f.next() orelse break;
+            const val = std.fmt.parseInt(u64, val_str, 10) catch continue;
+            const name = std.fmt.bufPrint(&name_buf, "node_sockstat_{s}_{s}", .{ proto, key }) catch continue;
+            try sink.emit(.{ .name = name, .help = "Socket usage from /proc/net/sockstat.", .kind = .gauge }, &.{}, .{ .int = val });
+        }
+    }
+}
+
+// --- netstat (curated /proc/net/snmp + /proc/net/netstat) --------------------
+
+/// A curated allowlist keeps cardinality sane — these files carry ~150 fields.
+const netstat_allow = [_][2][]const u8{
+    .{ "Tcp", "ActiveOpens" },        .{ "Tcp", "PassiveOpens" },
+    .{ "Tcp", "CurrEstab" },          .{ "Tcp", "InSegs" },
+    .{ "Tcp", "OutSegs" },            .{ "Tcp", "RetransSegs" },
+    .{ "Tcp", "InErrs" },             .{ "Tcp", "EstabResets" },
+    .{ "Udp", "InDatagrams" },        .{ "Udp", "OutDatagrams" },
+    .{ "Udp", "InErrors" },           .{ "Udp", "NoPorts" },
+    .{ "TcpExt", "ListenOverflows" }, .{ "TcpExt", "ListenDrops" },
+    .{ "TcpExt", "SyncookiesSent" },
+};
+
+fn netstatAllowed(proto: []const u8, field: []const u8) bool {
+    for (netstat_allow) |p| {
+        if (std.mem.eql(u8, proto, p[0]) and std.mem.eql(u8, field, p[1])) return true;
+    }
+    return false;
+}
+
+fn collectNetstat(ctx: Context, sink: Sink) anyerror!void {
+    const snmp = try readProc(ctx, "net/snmp");
+    defer ctx.gpa.free(snmp);
+    try emitNetstat(snmp, sink);
+
+    // TcpExt lives in a separate file; its absence must not fail the collector.
+    if (readProc(ctx, "net/netstat")) |ns| {
+        defer ctx.gpa.free(ns);
+        try emitNetstat(ns, sink);
+    } else |_| {}
+}
+
+/// snmp/netstat format: alternating header and value lines sharing a proto tag,
+/// e.g. "Tcp: ActiveOpens ..." then "Tcp: 100 ...". Zip them, emit allowlisted.
+fn emitNetstat(data: []const u8, sink: Sink) anyerror!void {
+    var name_buf: [128]u8 = undefined;
+    var lines = std.mem.tokenizeScalar(u8, data, '\n');
+    while (true) {
+        const header = lines.next() orelse break;
+        const values = lines.next() orelse break;
+        const hc = std.mem.indexOfScalar(u8, header, ':') orelse continue;
+        const vc = std.mem.indexOfScalar(u8, values, ':') orelse continue;
+        const proto = header[0..hc];
+        if (!std.mem.eql(u8, proto, values[0..vc])) continue; // header/value misaligned
+
+        var hf = std.mem.tokenizeAny(u8, header[hc + 1 ..], " \t");
+        var vf = std.mem.tokenizeAny(u8, values[vc + 1 ..], " \t");
+        while (true) {
+            const field = hf.next() orelse break;
+            const val_str = vf.next() orelse break;
+            if (!netstatAllowed(proto, field)) continue;
+            const val = std.fmt.parseInt(u64, val_str, 10) catch continue; // negatives (e.g. MaxConn) not in allowlist
+            const name = std.fmt.bufPrint(&name_buf, "node_netstat_{s}_{s}", .{ proto, field }) catch continue;
+            const kind: metric.Kind = if (std.mem.eql(u8, field, "CurrEstab")) .gauge else .counter;
+            try sink.emit(.{ .name = name, .help = "Network statistic from /proc/net.", .kind = kind }, &.{}, .{ .int = val });
+        }
+    }
+}
+
 // --- tests -------------------------------------------------------------------
+
+/// A sink that records emitted samples as "name{labels} value" lines, for tests.
+const TestSink = struct {
+    w: *std.Io.Writer,
+    fn sink(self: *TestSink) Sink {
+        return .{ .ptr = self, .emitFn = emit };
+    }
+    fn emit(ptr: *anyopaque, m: Metric, labels: []const Label, value: metric.Value) anyerror!void {
+        const self: *TestSink = @ptrCast(@alignCast(ptr));
+        try self.w.writeAll(m.name);
+        for (labels) |l| try self.w.print("{{{s}={s}}}", .{ l.name, l.value });
+        switch (value) {
+            .int => |v| try self.w.print(" {d}\n", .{v}),
+            .float => |v| try self.w.print(" {d}\n", .{v}),
+        }
+    }
+};
 
 test "parseMeminfoLine: standard kB line" {
     const got = parseMeminfoLine("MemTotal:       16384000 kB").?;
@@ -718,4 +847,43 @@ test "statValue: matches key exactly and takes first field" {
     try std.testing.expect(statValue(data, "nope") == null);
     // must not match "cpu" as a prefix of "cpu0"
     try std.testing.expectEqual(@as(u64, 1), statValue(data, "cpu").?);
+}
+
+test "emitSockstat: one gauge per key/val pair" {
+    const data =
+        \\sockets: used 500
+        \\TCP: inuse 10 orphan 0 tw 5 alloc 20 mem 3
+        \\UDP: inuse 8 mem 2
+        \\
+    ;
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var ts = TestSink{ .w = &w };
+    try emitSockstat(data, ts.sink());
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "node_sockstat_sockets_used 500\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "node_sockstat_TCP_inuse 10\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "node_sockstat_TCP_alloc 20\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "node_sockstat_UDP_mem 2\n") != null);
+}
+
+test "emitNetstat: zips header/values, applies allowlist" {
+    const data =
+        \\Tcp: RtoAlgorithm RtoMin MaxConn ActiveOpens PassiveOpens CurrEstab RetransSegs
+        \\Tcp: 1 200 -1 111 22 8 3
+        \\Udp: InDatagrams NoPorts OutDatagrams
+        \\Udp: 900 4 800
+        \\
+    ;
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var ts = TestSink{ .w = &w };
+    try emitNetstat(data, ts.sink());
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "node_netstat_Tcp_ActiveOpens 111\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "node_netstat_Tcp_CurrEstab 8\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "node_netstat_Udp_NoPorts 4\n") != null);
+    // non-allowlisted fields must be skipped
+    try std.testing.expect(std.mem.indexOf(u8, out, "RtoAlgorithm") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MaxConn") == null);
 }

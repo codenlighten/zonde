@@ -93,6 +93,9 @@ container's. (Or just run the [systemd unit](#running-as-a-service-systemd) on t
 | filefd | `node_filefd_allocated`, `node_filefd_maximum` (gauge) | `/proc/sys/fs/file-nr` |
 | entropy | `node_entropy_available_bits`, `node_entropy_pool_size_bits` (gauge) | `/proc/sys/kernel/random/*` |
 | stat | `node_context_switches_total`, `node_intr_total`, `node_forks_total` (counter); `node_procs_running`, `node_procs_blocked`, `node_boot_time_seconds` (gauge) | `/proc/stat` |
+| uname | `node_uname_info{sysname,release,version,machine,nodename,domainname}` (gauge) | `uname(2)` |
+| sockstat | `node_sockstat_<proto>_<stat>` (gauge) | `/proc/net/sockstat` |
+| netstat | `node_netstat_{Tcp,Udp,TcpExt}_<field>` — curated TCP/UDP counters | `/proc/net/{snmp,netstat}` |
 
 Plus `zonde_up` and, on any collector failure, `zonde_collector_error{collector,error}` (the
 scrape still succeeds). Adding a collector = one parse function + one `registry` entry.
