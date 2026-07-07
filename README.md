@@ -89,3 +89,7 @@ Zig is pinned to `0.16.0` (matches `build.zig.zon`'s `minimum_zig_version`).
   `zonde_collector_error` metric instead of aborting the scrape.
 - **`/proc` files stream to EOF** — they report `st_size == 0`, so we read via
   `allocRemaining`, not `readFileAlloc`.
+
+## License
+
+MIT © 2026 Gregory Ward. See [LICENSE](LICENSE).

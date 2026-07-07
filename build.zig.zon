@@ -10,5 +10,6 @@
         "src",
         "DECISION.md",
         "README.md",
+        "LICENSE",
     },
 }
