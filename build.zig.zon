@@ -1,0 +1,14 @@
+.{
+    .name = .zonde,
+    .version = "0.0.0",
+    .fingerprint = 0x68053578fc7e72e6,
+    .minimum_zig_version = "0.16.0-dev.3153+d6f43caad",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "DECISION.md",
+        "README.md",
+    },
+}

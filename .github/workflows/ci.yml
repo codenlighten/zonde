@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Pin the Zig version in one place so it matches build.zig.zon's
+# minimum_zig_version and the toolchain this project was written against.
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  check:
+    name: format + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Formatting
+        run: zig fmt --check src build.zig
+      - name: Tests
+        run: zig build test
+
+  release:
+    name: cross-compile matrix (size-gated)
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # `zig build release` builds linux {x86_64,aarch64}x{gnu,musl} stripped
+      # ReleaseSmall binaries and fails if any exceeds the 2 MiB size budget.
+      - name: Build release matrix
+        run: zig build release
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: zonde-binaries
+          path: zig-out/release/
+          if-no-files-found: error
