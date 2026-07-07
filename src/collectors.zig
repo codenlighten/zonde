@@ -37,6 +37,7 @@ pub const Context = struct {
     gpa: Allocator,
     procfs: []const u8 = "/proc",
     rootfs: []const u8 = "",
+    sysfs: []const u8 = "/sys",
 };
 
 const CollectFn = *const fn (Context, Sink) anyerror!void;
@@ -60,6 +61,7 @@ pub const registry = [_]Collector{
     .{ .name = "uname", .collect = collectUname },
     .{ .name = "sockstat", .collect = collectSockstat },
     .{ .name = "netstat", .collect = collectNetstat },
+    .{ .name = "thermal", .collect = collectThermal },
 };
 
 /// Run every collector once, emitting a full set of samples into `sink`.
@@ -75,17 +77,25 @@ pub fn scrape(ctx: Context, sink: Sink) anyerror!void {
 
 // --- shared helpers ---------------------------------------------------------
 
-/// Read a whole file under the procfs base (e.g. `sub = "meminfo"` ->
-/// `<procfs>/meminfo`). We must stream to EOF rather than use `readFileAlloc`:
-/// /proc files report `st_size == 0`, so any size-hinted read returns empty.
-fn readProc(ctx: Context, sub: []const u8) ![]u8 {
+/// Read a whole virtual file under `base` (e.g. `base=<procfs>, sub="meminfo"`).
+/// We must stream to EOF rather than use `readFileAlloc`: /proc and /sys files
+/// report `st_size == 0`, so any size-hinted read returns empty.
+fn readVirtual(ctx: Context, base: []const u8, sub: []const u8) ![]u8 {
     var path_buf: [4096]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ ctx.procfs, sub });
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ base, sub });
     var file = try std.Io.Dir.cwd().openFile(ctx.io, path, .{});
     defer file.close(ctx.io);
     var read_buf: [4096]u8 = undefined;
     var reader = file.readerStreaming(ctx.io, &read_buf);
     return reader.interface.allocRemaining(ctx.gpa, .limited(1 << 20));
+}
+
+fn readProc(ctx: Context, sub: []const u8) ![]u8 {
+    return readVirtual(ctx, ctx.procfs, sub);
+}
+
+fn readSys(ctx: Context, sub: []const u8) ![]u8 {
+    return readVirtual(ctx, ctx.sysfs, sub);
 }
 
 fn emitCollectorError(sink: Sink, collector: []const u8, err: anyerror) anyerror!void {
@@ -704,6 +714,40 @@ fn emitNetstat(data: []const u8, sink: Sink) anyerror!void {
             const kind: metric.Kind = if (std.mem.eql(u8, field, "CurrEstab")) .gauge else .counter;
             try sink.emit(.{ .name = name, .help = "Network statistic from /proc/net.", .kind = kind }, &.{}, .{ .int = val });
         }
+    }
+}
+
+// --- thermal (sysfs) ---------------------------------------------------------
+
+/// Enumerate `<sysfs>/class/thermal/thermal_zone*`, reading each zone's `temp`
+/// (millidegrees C) and `type`. This is the first collector that iterates a
+/// directory and reads /sys, so it uses the `sysfs` base path.
+fn collectThermal(ctx: Context, sink: Sink) anyerror!void {
+    var dir_path_buf: [4096]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&dir_path_buf, "{s}/class/thermal", .{ctx.sysfs});
+    var dir = try std.Io.Dir.cwd().openDir(ctx.io, dir_path, .{ .iterate = true });
+    defer dir.close(ctx.io);
+
+    const m: Metric = .{ .name = "node_thermal_zone_temp", .help = "Thermal zone temperature in Celsius.", .kind = .gauge };
+    var it = dir.iterate();
+    while (try it.next(ctx.io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "thermal_zone")) continue;
+        const zone = entry.name["thermal_zone".len..]; // the trailing number
+
+        var sub_buf: [256]u8 = undefined;
+        const temp_sub = std.fmt.bufPrint(&sub_buf, "class/thermal/{s}/temp", .{entry.name}) catch continue;
+        const temp_data = readSys(ctx, temp_sub) catch continue; // some zones expose no temp
+        defer ctx.gpa.free(temp_data);
+        const milli = std.fmt.parseInt(i64, std.mem.trim(u8, temp_data, " \t\n\r"), 10) catch continue;
+
+        var type_buf: [256]u8 = undefined;
+        const type_sub = std.fmt.bufPrint(&type_buf, "class/thermal/{s}/type", .{entry.name}) catch continue;
+        const type_data = readSys(ctx, type_sub) catch continue;
+        defer ctx.gpa.free(type_data);
+        const ztype = std.mem.trim(u8, type_data, " \t\n\r");
+
+        const celsius = @as(f64, @floatFromInt(milli)) / 1000.0;
+        try sink.emit(m, &.{ .{ .name = "zone", .value = zone }, .{ .name = "type", .value = ztype } }, .{ .float = celsius });
     }
 }
 

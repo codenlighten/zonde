@@ -18,6 +18,7 @@ pub const Config = struct {
     // Base paths for host monitoring from a container (node_exporter-style).
     procfs_path: []const u8 = "/proc",
     rootfs_path: []const u8 = "",
+    sysfs_path: []const u8 = "/sys",
 };
 
 /// Defaults overlaid with `ZONDE_*` environment variables. Malformed numeric
@@ -37,5 +38,6 @@ pub fn fromEnv(env: *const Environ.Map) Config {
     }
     if (env.get("ZONDE_PATH_PROCFS")) |v| c.procfs_path = v;
     if (env.get("ZONDE_PATH_ROOTFS")) |v| c.rootfs_path = v;
+    if (env.get("ZONDE_PATH_SYSFS")) |v| c.sysfs_path = v;
     return c;
 }

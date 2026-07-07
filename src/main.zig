@@ -58,6 +58,10 @@ pub fn main(init: std.process.Init) !void {
             cfg.rootfs_path = args.next() orelse fatal(io, "--path.rootfs requires a path", .{});
         } else if (std.mem.startsWith(u8, arg, "--path.rootfs=")) {
             cfg.rootfs_path = arg["--path.rootfs=".len..];
+        } else if (std.mem.eql(u8, arg, "--path.sysfs")) {
+            cfg.sysfs_path = args.next() orelse fatal(io, "--path.sysfs requires a path", .{});
+        } else if (std.mem.startsWith(u8, arg, "--path.sysfs=")) {
+            cfg.sysfs_path = arg["--path.sysfs=".len..];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try usage(io);
             return;
@@ -71,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
         .gpa = gpa,
         .procfs = cfg.procfs_path,
         .rootfs = cfg.rootfs_path,
+        .sysfs = cfg.sysfs_path,
     };
 
     switch (cfg.mode) {
@@ -98,7 +103,7 @@ fn parseArg(io: std.Io, comptime T: type, val: []const u8) T {
 }
 
 fn usage(io: std.Io) !void {
-    var buf: [1024]u8 = undefined;
+    var buf: [1280]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
     try stdout.interface.writeAll(
         \\zonde — tiny observability agent
@@ -111,11 +116,12 @@ fn usage(io: std.Io) !void {
         \\  zonde --otlp URL          push OTLP/JSON to URL on an interval
         \\  zonde --otlp URL --interval S   push every S seconds (default 60)
         \\  zonde --path.procfs PATH  where /proc is mounted (default /proc)
+        \\  zonde --path.sysfs PATH   where /sys is mounted (default /sys)
         \\  zonde --path.rootfs PATH  prefix for filesystem mountpoints (container host mon.)
         \\  zonde --help              show this help
         \\
         \\env: ZONDE_LISTEN_ADDR, ZONDE_PORT, ZONDE_OTLP_ENDPOINT, ZONDE_INTERVAL,
-        \\     ZONDE_PATH_PROCFS, ZONDE_PATH_ROOTFS
+        \\     ZONDE_PATH_PROCFS, ZONDE_PATH_SYSFS, ZONDE_PATH_ROOTFS
         \\     (flags override env; env overrides defaults)
         \\
     );

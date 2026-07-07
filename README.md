@@ -33,6 +33,7 @@ Precedence is **flags > env > defaults**:
 | `--otlp URL` | `ZONDE_OTLP_ENDPOINT` | (unset → pull mode) |
 | `--interval S` | `ZONDE_INTERVAL` | `60` |
 | `--path.procfs PATH` | `ZONDE_PATH_PROCFS` | `/proc` |
+| `--path.sysfs PATH` | `ZONDE_PATH_SYSFS` | `/sys` |
 | `--path.rootfs PATH` | `ZONDE_PATH_ROOTFS` | (none) |
 
 ## Release & container
@@ -55,14 +56,15 @@ bind-mount the host's `/proc` (and root, for filesystem stats) and point zonde a
 
 ```sh
 docker run -p 9100:9100 \
-  -v /proc:/host/proc:ro -v /:/host/root:ro \
+  -v /proc:/host/proc:ro -v /sys:/host/sys:ro -v /:/host/root:ro \
   ghcr.io/codenlighten/zonde:latest \
-  --path.procfs /host/proc --path.rootfs /host/root
+  --path.procfs /host/proc --path.sysfs /host/sys --path.rootfs /host/root
 ```
 
-`--path.procfs` relocates every `/proc` read; `--path.rootfs` is prepended to filesystem
-mountpoints before `statfs`, so disk metrics reflect the host's filesystems, not the
-container's. (Or just run the [systemd unit](#running-as-a-service-systemd) on the host.)
+`--path.procfs` relocates every `/proc` read; `--path.sysfs` does the same for `/sys` (thermal);
+`--path.rootfs` is prepended to filesystem mountpoints before `statfs`, so disk metrics reflect
+the host's filesystems, not the container's. (Or just run the
+[systemd unit](#running-as-a-service-systemd) on the host.)
 
 ## Two ways to ship metrics
 
@@ -96,6 +98,7 @@ container's. (Or just run the [systemd unit](#running-as-a-service-systemd) on t
 | uname | `node_uname_info{sysname,release,version,machine,nodename,domainname}` (gauge) | `uname(2)` |
 | sockstat | `node_sockstat_<proto>_<stat>` (gauge) | `/proc/net/sockstat` |
 | netstat | `node_netstat_{Tcp,Udp,TcpExt}_<field>` — curated TCP/UDP counters | `/proc/net/{snmp,netstat}` |
+| thermal | `node_thermal_zone_temp{zone,type}` — °C | `/sys/class/thermal/*` |
 
 Plus `zonde_up` and, on any collector failure, `zonde_collector_error{collector,error}` (the
 scrape still succeeds). Adding a collector = one parse function + one `registry` entry.
