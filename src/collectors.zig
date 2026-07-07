@@ -54,6 +54,9 @@ pub const registry = [_]Collector{
     .{ .name = "diskstats", .collect = collectDiskstats },
     .{ .name = "pressure", .collect = collectPressure },
     .{ .name = "filesystem", .collect = collectFilesystem },
+    .{ .name = "filefd", .collect = collectFilefd },
+    .{ .name = "entropy", .collect = collectEntropy },
+    .{ .name = "stat", .collect = collectStat },
 };
 
 /// Run every collector once, emitting a full set of samples into `sink`.
@@ -517,6 +520,81 @@ fn octalByte(digits: []const u8) ?u8 {
     return if (v <= 255) @intCast(v) else null;
 }
 
+// --- filefd ------------------------------------------------------------------
+
+const FileNr = struct { allocated: u64, max: u64 };
+
+/// `/proc/sys/fs/file-nr` is one line: "<allocated> <unused> <max>".
+fn parseFileNr(data: []const u8) ?FileNr {
+    var f = std.mem.tokenizeAny(u8, data, " \t\n");
+    const allocated = f.next() orelse return null;
+    _ = f.next() orelse return null; // unused (always 0 on modern kernels)
+    const max = f.next() orelse return null;
+    return .{
+        .allocated = std.fmt.parseInt(u64, allocated, 10) catch return null,
+        .max = std.fmt.parseInt(u64, max, 10) catch return null,
+    };
+}
+
+fn collectFilefd(ctx: Context, sink: Sink) anyerror!void {
+    const data = try readProc(ctx, "sys/fs/file-nr");
+    defer ctx.gpa.free(data);
+    const fnr = parseFileNr(data) orelse return error.MalformedFileNr;
+    try sink.emit(.{ .name = "node_filefd_allocated", .help = "Allocated file descriptors.", .kind = .gauge }, &.{}, .{ .int = fnr.allocated });
+    try sink.emit(.{ .name = "node_filefd_maximum", .help = "Maximum file descriptors.", .kind = .gauge }, &.{}, .{ .int = fnr.max });
+}
+
+// --- entropy -----------------------------------------------------------------
+
+fn collectEntropy(ctx: Context, sink: Sink) anyerror!void {
+    const avail = try readProc(ctx, "sys/kernel/random/entropy_avail");
+    defer ctx.gpa.free(avail);
+    const bits = std.fmt.parseInt(u64, std.mem.trim(u8, avail, " \t\n\r"), 10) catch return error.MalformedEntropy;
+    try sink.emit(.{ .name = "node_entropy_available_bits", .help = "Available entropy in bits.", .kind = .gauge }, &.{}, .{ .int = bits });
+
+    // Pool size is informative but optional; its absence must not fail the collector.
+    if (readProc(ctx, "sys/kernel/random/poolsize")) |ps| {
+        defer ctx.gpa.free(ps);
+        if (std.fmt.parseInt(u64, std.mem.trim(u8, ps, " \t\n\r"), 10) catch null) |size| {
+            try sink.emit(.{ .name = "node_entropy_pool_size_bits", .help = "Entropy pool size in bits.", .kind = .gauge }, &.{}, .{ .int = size });
+        }
+    } else |_| {}
+}
+
+// --- stat (non-CPU counters from /proc/stat) --------------------------------
+
+/// Return the first numeric field of the `/proc/stat` line starting with `key`
+/// (e.g. `key = "ctxt"` -> the context-switch counter). Null if absent.
+fn statValue(data: []const u8, key: []const u8) ?u64 {
+    var lines = std.mem.tokenizeScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        var f = std.mem.tokenizeAny(u8, line, " \t");
+        const k = f.next() orelse continue;
+        if (!std.mem.eql(u8, k, key)) continue;
+        const v = f.next() orelse return null;
+        return std.fmt.parseInt(u64, v, 10) catch null;
+    }
+    return null;
+}
+
+fn collectStat(ctx: Context, sink: Sink) anyerror!void {
+    const data = try readProc(ctx, "stat");
+    defer ctx.gpa.free(data);
+
+    if (statValue(data, "ctxt")) |n|
+        try sink.emit(.{ .name = "node_context_switches_total", .help = "Context switches since boot.", .kind = .counter }, &.{}, .{ .int = n });
+    if (statValue(data, "intr")) |n|
+        try sink.emit(.{ .name = "node_intr_total", .help = "Interrupts serviced since boot.", .kind = .counter }, &.{}, .{ .int = n });
+    if (statValue(data, "processes")) |n|
+        try sink.emit(.{ .name = "node_forks_total", .help = "Forks since boot.", .kind = .counter }, &.{}, .{ .int = n });
+    if (statValue(data, "procs_running")) |n|
+        try sink.emit(.{ .name = "node_procs_running", .help = "Processes in runnable state.", .kind = .gauge }, &.{}, .{ .int = n });
+    if (statValue(data, "procs_blocked")) |n|
+        try sink.emit(.{ .name = "node_procs_blocked", .help = "Processes blocked on I/O.", .kind = .gauge }, &.{}, .{ .int = n });
+    if (statValue(data, "btime")) |n|
+        try sink.emit(.{ .name = "node_boot_time_seconds", .help = "Unix time of system boot.", .kind = .gauge }, &.{}, .{ .int = n });
+}
+
 // --- tests -------------------------------------------------------------------
 
 test "parseMeminfoLine: standard kB line" {
@@ -611,4 +689,33 @@ test "buildStatfsPath: decodes escapes, applies rootfs prefix, NUL-terminates" {
     // rootfs prefix for container host-monitoring
     const p2 = buildStatfsPath("/host/root", "/home", &buf).?;
     try std.testing.expectEqualStrings("/host/root/home", p2);
+}
+
+test "parseFileNr: allocated + max, ignoring the middle field" {
+    const fnr = parseFileNr("1216\t0\t9223372036854775807\n").?;
+    try std.testing.expectEqual(@as(u64, 1216), fnr.allocated);
+    try std.testing.expectEqual(@as(u64, 9223372036854775807), fnr.max);
+    try std.testing.expect(parseFileNr("1216 0") == null); // missing max
+}
+
+test "statValue: matches key exactly and takes first field" {
+    const data =
+        \\cpu  1 2 3 4 5 6 7 8
+        \\cpu0 1 2 3 4 5 6 7 8
+        \\intr 987654 0 0 0
+        \\ctxt 12345678
+        \\btime 1700000000
+        \\processes 90210
+        \\procs_running 3
+        \\procs_blocked 0
+        \\
+    ;
+    try std.testing.expectEqual(@as(u64, 12345678), statValue(data, "ctxt").?);
+    try std.testing.expectEqual(@as(u64, 987654), statValue(data, "intr").?);
+    try std.testing.expectEqual(@as(u64, 90210), statValue(data, "processes").?);
+    try std.testing.expectEqual(@as(u64, 3), statValue(data, "procs_running").?);
+    try std.testing.expectEqual(@as(u64, 1700000000), statValue(data, "btime").?);
+    try std.testing.expect(statValue(data, "nope") == null);
+    // must not match "cpu" as a prefix of "cpu0"
+    try std.testing.expectEqual(@as(u64, 1), statValue(data, "cpu").?);
 }
